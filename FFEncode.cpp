@@ -147,6 +147,8 @@ public:
         }
 
         _swsCtx = sws_getContext(srcWidth, srcHeight, pixFormat, dstWidth, dstHeight, AV_PIX_FMT_YUV420P, SWS_BICUBIC, 0, 0, 0);
+
+       
         return true;
     }
 
@@ -227,32 +229,87 @@ private:
 };
 
 
+
+
 class WindowRecorder
 {
 public:
+    static std::tuple<int, int> CalcPad(int srcWidth, int srcHeight, int videoWidth, int videoHeight)
+    {
+        const double srcAspect = (double)srcWidth / (double)srcHeight;
+        const double dstAspect = (double)videoWidth / (double)videoHeight;
+        const bool padWidth = srcAspect < dstAspect;
+        const bool padHeight = srcAspect > dstAspect;
+        int padW = 0;
+        int padH = 0;
+        if (padHeight)
+        {
+            padH = (int)(srcWidth / dstAspect) - srcHeight;
+        }
+        else if (padWidth)
+        {
+            padW = (int)(dstAspect * srcHeight) - srcWidth;
+        }
+        return std::make_tuple(padW, padH);
+    }
+
+
+    static HMONITOR GetPrimaryMonitor()
+    {
+        POINT ptZero = { 0, 0 };
+        return MonitorFromPoint(ptZero,
+            MONITOR_DEFAULTTOPRIMARY);
+    }
+
+    static float GetMonitorScalingRatio(HWND hwnd)
+    {
+        HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFOEX info = { };
+        info.cbSize = sizeof(info);
+        GetMonitorInfo(monitor, &info);
+        DEVMODE devmode = {};
+        devmode.dmSize = sizeof(DEVMODE);
+        EnumDisplaySettings(info.szDevice, ENUM_CURRENT_SETTINGS, &devmode);
+        return static_cast<float>(devmode.dmPelsWidth) / (info.rcMonitor.right - info.rcMonitor.left);
+    }
+
+
     bool Init(const char* fileName, int fps, int videoWidth, int videoHeight)
     {
-        if (_hUnityEditor != nullptr)
-        {
-            return false;
-        }
-        _hUnityEditor = FindWindowW(TEXT("UnityContainerWndClass"), nullptr);
-        if (_hUnityEditor == nullptr)
-        {
-            return false;
-        }
-        _hTargetWnd = FindWindowExW(_hUnityEditor, nullptr, TEXT("UnityGUIViewWndClass"), TEXT("UnityEditor.GameView"));
-        if (_hTargetWnd == nullptr)
+        if (_hTargetWnd != nullptr)
         {
             return false;
         }
 
+#if false
+        const HWND hUnityEditor = FindWindowW(TEXT("UnityContainerWndClass"), nullptr);
+        if (hUnityEditor == nullptr)
+        {
+            return false;
+        }
+        _hTargetWnd = FindWindowExW(hUnityEditor, nullptr, TEXT("UnityGUIViewWndClass"), TEXT("UnityEditor.GameView"));
+        if (_hTargetWnd == nullptr)
+        {
+            return false;
+        }
+#else
+        _hTargetWnd = (HWND)0x000605C8;// FindWindowW(TEXT("TLoginForm"), nullptr);
+#endif
+
         RECT rc;
         GetWindowRect(_hTargetWnd, &rc);
-        const int srcWidth = rc.right - rc.left;
-        const int srcHeight = rc.bottom - rc.top;
-        _recorder.Init(fileName, fps, AV_PIX_FMT_BGRA, srcWidth, srcHeight, videoWidth, videoHeight);
-        _rawFrame = std::make_unique<uint8_t[]>(srcWidth * srcHeight * 4);
+
+        const float monitorRatio = GetMonitorScalingRatio(_hTargetWnd);
+        _srcWidth = (rc.right - rc.left);
+        _srcHeight = (rc.bottom - rc.top);
+        _srcWidth = int(_srcWidth * monitorRatio);
+        _srcHeight = int(_srcHeight * monitorRatio);
+        std::tie(_padW, _padH) = CalcPad(_srcWidth, _srcHeight, videoWidth, videoHeight);
+        
+        const int padWidth = _srcWidth + _padW;
+        const int padHeight = _srcHeight + _padH;
+        _recorder.Init(fileName, fps, AV_PIX_FMT_BGRA, padWidth, padHeight, videoWidth, videoHeight);
+        _rawFrame = std::make_unique<uint8_t[]>(padWidth * padHeight * 4);
 
         return true;
     }
@@ -267,12 +324,14 @@ public:
         BITMAPINFO bmi = { 0 };
         bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
         bmi.bmiHeader.biWidth = _recorder.SrcWidth();
-        bmi.bmiHeader.biHeight = -_recorder.SrcHeight();
+        bmi.bmiHeader.biHeight = -_recorder.SrcHeight(); //upside down
         bmi.bmiHeader.biPlanes = 1;
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = BI_RGB;
 
-        BitBlt(hCaptureDC, 0, 0, _recorder.SrcWidth(), _recorder.SrcHeight(), hDesktopDC, 0, 0, SRCCOPY | CAPTUREBLT);
+        //BitBlt(hCaptureDC, 0, 0, _srcWidth, _srcHeight, hDesktopDC, 0, 0, SRCCOPY);
+        BitBlt(hCaptureDC, _padW / 2, _padH / 2, _srcWidth, _srcHeight, hDesktopDC, 0, 0, SRCCOPY);
+        //StretchBlt(hCaptureDC, _padW / 2, _padH / 2, _srcWidth, _srcHeight, hDesktopDC, 0, 0, _srcWidth, _srcHeight, SRCCOPY);
         GetDIBits(
             hCaptureDC,
             hCaptureBitmap,
@@ -293,18 +352,20 @@ public:
     void Release()
     {
         _recorder.Release();
-        _hUnityEditor = nullptr;
         _hTargetWnd = nullptr;
         _rawFrame = nullptr;
     }
 private:
     FFFrameRecorder _recorder;
     std::unique_ptr<uint8_t[]> _rawFrame;
-    HWND _hUnityEditor = nullptr;
     HWND _hTargetWnd = nullptr;
+    int _padW = 0;
+    int _padH = 0;
+    int _srcWidth = 0;
+    int _srcHeight = 0;
 };
 
-#if _DLL > 0
+#if !defined(_CONSOLE)
 extern "C"
 {
     __declspec(dllexport)
@@ -344,82 +405,13 @@ extern "C"
 int main(int argc, char* argv[])
 {
     WindowRecorder r;
-    r.Init("test.mp4", 30, 1920, 1080);
+    r.Init("test.mp4", 2, 1920, 1080);
     const auto frameTime = std::chrono::milliseconds(33);
-    for (int frameID = 0; frameID < 360; ++frameID)
+    for (int frameID = 0; frameID < 128; ++frameID)
     {
-        const auto timeStart = std::chrono::steady_clock::now();
         r.CapAndRecord();
-        const auto timeFinish = std::chrono::steady_clock::now();
-        auto workTime = timeFinish - timeStart;
-        if (workTime < frameTime)
-        {
-            Sleep((DWORD)std::chrono::duration_cast<std::chrono::milliseconds>(frameTime - workTime).count());
-        }
     }
     r.Release();
-    /*HWND hUnityEditor = FindWindowW(TEXT("UnityContainerWndClass"), nullptr);
-    if (hUnityEditor == nullptr)
-    {
-        return 0;
-    }
-    HWND hTargetWnd = FindWindowExW(hUnityEditor, nullptr, TEXT("UnityGUIViewWndClass"), TEXT("UnityEditor.GameView"));
-    if (hTargetWnd == nullptr)
-    {
-        return 0;
-    }
-    RECT rc;
-    GetWindowRect(hTargetWnd, &rc);
-    const int srcWidth = rc.right - rc.left;
-    const int srcHeight = rc.bottom - rc.top;
-    FFFrameRecorder recorder;
-    recorder.Init("test.mp4", 30, AV_PIX_FMT_BGRA, srcWidth, srcHeight, 1920, 1080);
-    std::vector<uint8_t> frameraw(srcWidth * srcHeight * 4);
-
-    const auto frameTime = std::chrono::milliseconds(33);
-    for (int frameID = 0; frameID < 720; ++frameID)
-    {
-        const auto timeStart = std::chrono::steady_clock::now();
-        HDC hDesktopDC = GetDC(hTargetWnd);
-        HDC hCaptureDC = CreateCompatibleDC(hDesktopDC);
-        HBITMAP hCaptureBitmap = CreateCompatibleBitmap(hDesktopDC, srcWidth, srcHeight);
-        SelectObject(hCaptureDC, hCaptureBitmap);
-
-        BITMAPINFO bmi = { 0 };
-        bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
-        bmi.bmiHeader.biWidth = srcWidth;
-        bmi.bmiHeader.biHeight = -srcHeight;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-
-        BitBlt(hCaptureDC, 0, 0, srcWidth, srcHeight, hDesktopDC, 0, 0, SRCCOPY | CAPTUREBLT);
-        GetDIBits(
-            hCaptureDC,
-            hCaptureBitmap,
-            0,
-            srcHeight,
-            frameraw.data(),
-            &bmi,
-            DIB_RGB_COLORS
-        );
-        recorder.pushFrame(frameraw.data());
-
-        ReleaseDC(hTargetWnd, hDesktopDC);
-        DeleteDC(hCaptureDC);
-        DeleteObject(hCaptureBitmap);
-        const auto timeFinish = std::chrono::steady_clock::now();
-
-        printf("%d\n", frameID);
-
-        auto workTime = timeFinish - timeStart;
-        if (workTime < frameTime)
-        {
-            Sleep((DWORD)std::chrono::duration_cast<std::chrono::milliseconds>(frameTime - workTime).count());
-        }
-    }
-
-    recorder.Release();*/
     return 0;
 }
 #endif
